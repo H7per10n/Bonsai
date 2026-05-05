@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+desktop.ini
+*.exe
+*.gch
+*.o
+build_*/
+.vscode/
+.claude/
+Bonsai/.git/
