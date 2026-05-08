@@ -12,4 +12,6 @@ build_*/
 Bonsai/.git/
 gen_minimal/
 models/
+tests/models/
+tests/generated/
 *.pytest_cache

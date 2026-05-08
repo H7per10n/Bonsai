@@ -28,7 +28,7 @@ where = ["."]
 include = ["Bonsai*"]
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
 
 [tool.black]
