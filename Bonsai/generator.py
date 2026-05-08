@@ -1,6 +1,6 @@
 
 import numpy as np
-from model_definitions import UnifiedModel, TreeData, TaskType
+from .model_definitions import UnifiedModel, TreeData, TaskType
 from typing import List, Dict, Tuple, NamedTuple
 from dataclasses import dataclass
 import math
@@ -10,10 +10,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class EmbeddedConfig:
-    """Simplified configuration with separate precision controls"""
+    """Configuration for embedded C code generation.
+
+    threshold_precision / leaf_precision: decimal places used when quantize=False.
+    quantize: store thresholds as fixed-point integers instead of a float lookup table.
+    quantize_bits: bit width for fixed-point encoding (8 → uint8_t, 16 → uint16_t).
+    """
     threshold_precision: int = 4
     leaf_precision: int = 4
     pack_structs: bool = True
+    quantize: bool = False
+    quantize_bits: int = 16
 
 class ArchitectureInfo:
     """Simplified architecture info (assume 32-bit generic)"""
@@ -89,6 +96,9 @@ class MinimalEmbeddedTreeGenerator:
         self.leaf_idx_type: DataTypeInfo = None
         self.metrics: OptimizationMetrics = None
         self.node_start_indices: List[int] = []
+        # Fixed-point quantization state (populated when config.quantize=True)
+        self.threshold_min: float = 0.0
+        self.threshold_step: float = 0.0  # THRESHOLD_RANGE / (2^quantize_bits - 1)
         
     def _initialize_type_info(self) -> Dict[str, DataTypeInfo]:
         """Initialize C data type information"""
@@ -146,47 +156,91 @@ class MinimalEmbeddedTreeGenerator:
         return self.metrics
     
     def _extract_unique_values(self):
-        """Extract globally unique thresholds and leaf values with separate precision"""
-        all_thresholds = set()
+        """Extract thresholds and leaf values.
+
+        Non-quantize mode: deduplicate into sorted float arrays used by the C shared-array.
+        Quantize mode: compute the global [min, max] range for fixed-point encoding;
+                       leaf values are still deduplicated (they already use a float array).
+        """
+        raw_thresholds: List[float] = []
         all_leaves = set()
-        
+
         for tree in self.model.trees:
             for i in range(tree.node_count):
                 if tree.children_left[i] == -1:
                     leaf_val = round(float(tree.values[i]), self.config.leaf_precision)
                     all_leaves.add(leaf_val)
                 else:
-                    threshold_val = round(float(tree.thresholds[i]), self.config.threshold_precision)
-                    all_thresholds.add(threshold_val)
-        
-        self.unique_thresholds = sorted(all_thresholds)
+                    raw_thresholds.append(float(tree.thresholds[i]))
+
+        if self.config.quantize:
+            t_min = min(raw_thresholds) if raw_thresholds else 0.0
+            t_max = max(raw_thresholds) if raw_thresholds else 0.0
+            bits_max = (1 << self.config.quantize_bits) - 1
+            self.threshold_min = t_min
+            self.threshold_step = (t_max - t_min) / bits_max if t_max > t_min else 1.0
+            self.unique_thresholds = []
+            self.threshold_map = {}
+        else:
+            deduped = set(
+                round(t, self.config.threshold_precision) for t in raw_thresholds
+            )
+            self.unique_thresholds = sorted(deduped)
+            self.threshold_map = {v: i for i, v in enumerate(self.unique_thresholds)}
+
         self.unique_leaves = sorted(all_leaves)
-        self.threshold_map = {v: i for i, v in enumerate(self.unique_thresholds)}
         self.leaf_map = {v: i for i, v in enumerate(self.unique_leaves)}
-        
-        logger.info(f"Extracted {len(self.unique_thresholds)} unique thresholds, "
-                   f"{len(self.unique_leaves)} unique leaves")
+
+        if self.config.quantize:
+            logger.info(
+                f"Quantized thresholds: min={self.threshold_min:.4f}, "
+                f"step={self.threshold_step:.6f} ({self.config.quantize_bits}-bit), "
+                f"{len(self.unique_leaves)} unique leaves"
+            )
+        else:
+            logger.info(
+                f"Extracted {len(self.unique_thresholds)} unique thresholds, "
+                f"{len(self.unique_leaves)} unique leaves"
+            )
+
+    def _quantize_threshold(self, t: float) -> int:
+        """Encode a threshold value as a fixed-point integer."""
+        if self.threshold_step == 0:
+            return 0
+        bits_max = (1 << self.config.quantize_bits) - 1
+        q = round((t - self.threshold_min) / self.threshold_step)
+        return max(0, min(bits_max, q))
     
     def _select_optimal_types(self):
-        """Select optimal data types based on value ranges"""
+        """Select optimal integer types based on value ranges."""
         max_feature = max((max(tree.features) for tree in self.model.trees if tree.features), default=0)
-        max_threshold_idx = len(self.unique_thresholds) - 1 if self.unique_thresholds else 0
         max_leaf_idx = len(self.unique_leaves) - 1 if self.unique_leaves else 0
         max_relative_node_idx = 0
         for tree in self.model.trees:
             if tree.node_count > 0:
                 tree_max_idx = max(max(tree.children_left, default=0), max(tree.children_right, default=0))
                 max_relative_node_idx = max(max_relative_node_idx, tree_max_idx)
-        
+
         self.feature_type = self._select_optimal_type(max_feature)
-        self.threshold_idx_type = self._select_optimal_type(max_threshold_idx)
         self.node_idx_type = self._select_optimal_type(max_relative_node_idx)
         self.leaf_idx_type = self._select_optimal_type(max_leaf_idx)
-        
-        logger.info(f"Selected types: feature={self.feature_type.c_type}, "
-                   f"threshold_idx={self.threshold_idx_type.c_type}, "
-                   f"node_idx={self.node_idx_type.c_type}, "
-                   f"leaf_idx={self.leaf_idx_type.c_type}")
+
+        if self.config.quantize:
+            # Type determined entirely by bit width, not by value count
+            bits_max = (1 << self.config.quantize_bits) - 1
+            self.threshold_idx_type = self._select_optimal_type(bits_max)
+        else:
+            max_threshold_idx = len(self.unique_thresholds) - 1 if self.unique_thresholds else 0
+            self.threshold_idx_type = self._select_optimal_type(max_threshold_idx)
+
+        thr_label = (f"{self.threshold_idx_type.c_type}(q{self.config.quantize_bits})"
+                     if self.config.quantize else self.threshold_idx_type.c_type)
+        logger.info(
+            f"Selected types: feature={self.feature_type.c_type}, "
+            f"threshold={thr_label}, "
+            f"node_idx={self.node_idx_type.c_type}, "
+            f"leaf_idx={self.leaf_idx_type.c_type}"
+        )
     
     def _calculate_node_indices(self):
         """Calculate start indices for single node array"""
@@ -201,7 +255,8 @@ class MinimalEmbeddedTreeGenerator:
         total_nodes = sum(max(tree.node_count, 1) for tree in self.model.trees)
         node_size = self._calculate_optimized_node_size()
         node_bytes = total_nodes * node_size
-        threshold_bytes = len(self.unique_thresholds) * 4
+        # Quantize mode replaces the float array with two scalar constants (8 bytes total)
+        threshold_bytes = 8 if self.config.quantize else len(self.unique_thresholds) * 4
         leaf_bytes = len(self.unique_leaves) * 4
         tree_struct_size = 4 + 2
         metadata_bytes = len(self.model.trees) * tree_struct_size
@@ -280,12 +335,17 @@ class CCodeGenerator:
                     node_str = f"    {{true, {{.leaf_idx={leaf_idx}}}}}"
                 else:
                     feature = int(tree.features[j])
-                    threshold_val = round(float(tree.thresholds[j]), self.config.threshold_precision)
-                    threshold_idx = self.gen.threshold_map.get(threshold_val, 0)
                     left = tree.children_left[j]
                     right = tree.children_right[j]
-                    node_str = (f"    {{false, {{.internal={{.feature={feature}, "
-                              f".threshold_idx={threshold_idx}, .left={left}, .right={right}}}}}}}")
+                    if self.config.quantize:
+                        tq = self.gen._quantize_threshold(float(tree.thresholds[j]))
+                        node_str = (f"    {{false, {{.internal={{.feature={feature}, "
+                                  f".threshold_q={tq}, .left={left}, .right={right}}}}}}}")
+                    else:
+                        threshold_val = round(float(tree.thresholds[j]), self.config.threshold_precision)
+                        threshold_idx = self.gen.threshold_map.get(threshold_val, 0)
+                        node_str = (f"    {{false, {{.internal={{.feature={feature}, "
+                                  f".threshold_idx={threshold_idx}, .left={left}, .right={right}}}}}}}")
                 
                 if i < len(self.gen.model.trees) - 1 or j < node_count - 1:
                     node_str += ","
@@ -299,10 +359,7 @@ class CCodeGenerator:
             if i < len(self.gen.model.trees) - 1:
                 tree_metadata[-1] += ","
         
-        # Generate thresholds and leaves
-        threshold_data = ", ".join(f"{t:.{self.config.threshold_precision}f}f" 
-                                 for t in self.gen.unique_thresholds) if self.gen.unique_thresholds else "0.0f"
-        leaf_data = ", ".join(f"{l:.{self.config.leaf_precision}f}f" 
+        leaf_data = ", ".join(f"{l:.{self.config.leaf_precision}f}f"
                             for l in self.gen.unique_leaves) if self.gen.unique_leaves else "0.0f"
         
         # Build template
@@ -317,19 +374,12 @@ class CCodeGenerator:
  *   - Task type: {task_type_str}
  *   - Base score: {self.model.base_score:.6f}
  * 
- * Optimization Configuration:
- *   - Threshold precision: {self.config.threshold_precision} decimal places
- *   - Leaf precision: {self.config.leaf_precision} decimal places
- *   - Packed structs: {'Yes' if self.config.pack_structs else 'No'}
- *   - Node size: {self.metrics.node_size_reduction[1]} bytes
- *   - Total nodes: {total_nodes}
- * 
- * Memory Usage:
- *   - Original: {self.metrics.original_memory.total_bytes:,} bytes
- *   - Optimized: {self.metrics.optimized_memory.total_bytes:,} bytes
- *   - Compression: {self.metrics.compression_ratio:.2f}x
- *   - Threshold deduplication: {self.metrics.threshold_deduplication[0]} -> {self.metrics.threshold_deduplication[1]}
- *   - Leaf deduplication: {self.metrics.leaf_deduplication[0]} -> {self.metrics.leaf_deduplication[1]}
+ * Threshold mode: {'fixed-point quantization (' + str(self.config.quantize_bits) + '-bit)' if self.config.quantize else 'float deduplication'}
+ * Leaf precision: {self.config.leaf_precision} decimal places
+ * Packed structs: {'Yes' if self.config.pack_structs else 'No'}
+ * Node size: {self.metrics.node_size_reduction[1]} bytes  |  Total nodes: {total_nodes}
+ * Memory: {self.metrics.original_memory.total_bytes:,} B → {self.metrics.optimized_memory.total_bytes:,} B  ({self.metrics.compression_ratio:.2f}x)
+ * Leaves: {self.metrics.leaf_deduplication[0]} → {self.metrics.leaf_deduplication[1]} unique
  * 
  * IMPORTANT: This file is automatically generated. Do not edit manually.
  */
@@ -346,55 +396,9 @@ class CCodeGenerator:
 extern "C" {
 #endif
 """,
-            f"""
-/* Model constants */
-#define N_TREES {len(self.gen.model.trees)}
-#define N_FEATURES {self.gen.model.num_features}
-#define N_CLASSES {self.gen.model.num_classes}
-#define N_THRESHOLDS {len(self.gen.unique_thresholds)}
-#define N_LEAVES {len(self.gen.unique_leaves)}
-#define TASK_TYPE {task_type_str}
-#define BASE_SCORE {self.model.base_score:.6f}f
-#define THRESHOLD_PRECISION {self.config.threshold_precision}
-#define LEAF_PRECISION {self.config.leaf_precision}
-#define PACK_STRUCTS {'1' if self.config.pack_structs else '0'}
-#define NODE_SIZE {self.metrics.node_size_reduction[1]}
-#define TOTAL_NODES {total_nodes}
-#define ORIGINAL_MEMORY {self.metrics.original_memory.total_bytes}
-#define OPTIMIZED_MEMORY {self.metrics.optimized_memory.total_bytes}
-#define COMPRESSION_RATIO {self.metrics.compression_ratio:.2f}
-#define ORIGINAL_THRESHOLDS {self.metrics.threshold_deduplication[0]}
-#define UNIQUE_THRESHOLDS {self.metrics.threshold_deduplication[1]}
-#define ORIGINAL_LEAVES {self.metrics.leaf_deduplication[0]}
-#define UNIQUE_LEAVES {self.metrics.leaf_deduplication[1]}
-""",
-            f"""
-/* Optimized tree node structure */
-{'#pragma pack(push, 1)' if self.config.pack_structs else ''}
-typedef struct {{
-    uint8_t is_leaf : 1;  /* Bitfield for minimal bool size */
-    union {{
-        struct {{
-            {self.gen.feature_type.c_type} feature;
-            {self.gen.threshold_idx_type.c_type} threshold_idx;
-            {self.gen.node_idx_type.c_type} left;
-            {self.gen.node_idx_type.c_type} right;
-        }} internal;
-        {self.gen.leaf_idx_type.c_type} leaf_idx;
-    }} u;
-}} OptNode;
-{'#pragma pack(pop)' if self.config.pack_structs else ''}
-
-typedef struct {{
-    uint32_t start_idx;  /* Start index in global node array */
-    uint16_t node_count;
-}} OptTree;
-""",
-            f"""
-/* Shared data arrays for deduplication */
-static const float SHARED_THRESHOLDS[N_THRESHOLDS] = {{ {threshold_data} }};
-static const float SHARED_LEAVES[N_LEAVES] = {{ {leaf_data} }};
-""",
+            self._generate_constants(total_nodes, task_type_str),
+            self._generate_struct(),
+            self._generate_data_section(leaf_data),
             f"""
 /* Single global node array */
 static const OptNode NODES[TOTAL_NODES] = {{
@@ -407,31 +411,7 @@ static const OptTree TREES[N_TREES] = {{
 {'\n'.join(tree_metadata)}
 }};
 """,
-            """
-/* Tree traversal function */
-static inline float traverse_tree(int tree_id, const float* x) {
-    const OptTree* tree = &TREES[tree_id];
-    uint32_t node_idx = tree->start_idx;
-
-    while (node_idx < tree->start_idx + tree->node_count) {
-        const OptNode* node = &NODES[node_idx];
-
-        if (node->is_leaf) {
-            return SHARED_LEAVES[node->u.leaf_idx];
-        }
-
-        float threshold = SHARED_THRESHOLDS[node->u.internal.threshold_idx];
-
-        if (x[node->u.internal.feature] < threshold) {
-            node_idx = tree->start_idx + node->u.internal.left;
-        } else {
-            node_idx = tree->start_idx + node->u.internal.right;
-        }
-    }
-
-    return 0.0f; /* Should never reach here */
-}
-""",
+            self._generate_traversal(),
             self._generate_predict_function(),
             f"""
 /*
@@ -459,6 +439,123 @@ static inline float traverse_tree(int tree_id, const float* x) {
         
         return "\n".join(sections)
     
+    def _generate_constants(self, total_nodes: int, task_type_str: str) -> str:
+        lines = [
+            "",
+            "/* Model constants */",
+            f"#define N_TREES     {len(self.gen.model.trees)}",
+            f"#define N_FEATURES  {self.gen.model.num_features}",
+            f"#define N_CLASSES   {self.gen.model.num_classes}",
+            f"#define N_LEAVES    {len(self.gen.unique_leaves)}",
+            f"#define TASK_TYPE   {task_type_str}",
+            f"#define BASE_SCORE  {self.model.base_score:.6f}f",
+            f"#define NODE_SIZE   {self.metrics.node_size_reduction[1]}",
+            f"#define TOTAL_NODES {total_nodes}",
+        ]
+        if self.config.quantize:
+            lines += [
+                f"#define THRESHOLD_MIN  {self.gen.threshold_min:.6f}f",
+                f"#define THRESHOLD_STEP {self.gen.threshold_step:.8f}f  "
+                f"/* range / {(1 << self.config.quantize_bits) - 1} */",
+            ]
+        else:
+            lines += [
+                f"#define N_THRESHOLDS {len(self.gen.unique_thresholds)}",
+            ]
+        lines += [
+            f"/* Memory: original={self.metrics.original_memory.total_bytes} B, "
+            f"optimized={self.metrics.optimized_memory.total_bytes} B, "
+            f"ratio={self.metrics.compression_ratio:.2f}x */",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def _generate_struct(self) -> str:
+        thr_field = (
+            f"threshold_q"
+            if self.config.quantize
+            else "threshold_idx"
+        )
+        pack_open  = "#pragma pack(push, 1)" if self.config.pack_structs else ""
+        pack_close = "#pragma pack(pop)"     if self.config.pack_structs else ""
+        return f"""
+/* Optimized tree node structure */
+{pack_open}
+typedef struct {{
+    uint8_t is_leaf : 1;  /* 1 = leaf node */
+    union {{
+        struct {{
+            {self.gen.feature_type.c_type} feature;
+            {self.gen.threshold_idx_type.c_type} {thr_field};
+            {self.gen.node_idx_type.c_type} left;
+            {self.gen.node_idx_type.c_type} right;
+        }} internal;
+        {self.gen.leaf_idx_type.c_type} leaf_idx;
+    }} u;
+}} OptNode;
+{pack_close}
+
+typedef struct {{
+    uint32_t start_idx;   /* first index in NODES[] for this tree */
+    uint16_t node_count;
+}} OptTree;
+"""
+
+    def _generate_data_section(self, leaf_data: str) -> str:
+        thr_type = self.gen.threshold_idx_type.c_type
+        if self.config.quantize:
+            return f"""
+/* Threshold decode helper: reconstructs float from fixed-point integer */
+static inline float decode_threshold({thr_type} q) {{
+    return THRESHOLD_MIN + q * THRESHOLD_STEP;
+}}
+
+/* Leaf value lookup table */
+static const float SHARED_LEAVES[N_LEAVES] = {{ {leaf_data} }};
+"""
+        else:
+            threshold_data = ", ".join(
+                f"{t:.{self.config.threshold_precision}f}f"
+                for t in self.gen.unique_thresholds
+            ) if self.gen.unique_thresholds else "0.0f"
+            return f"""
+/* Shared float arrays for deduplication */
+static const float SHARED_THRESHOLDS[N_THRESHOLDS] = {{ {threshold_data} }};
+static const float SHARED_LEAVES[N_LEAVES] = {{ {leaf_data} }};
+"""
+
+    def _generate_traversal(self) -> str:
+        thr_type = self.gen.threshold_idx_type.c_type
+        if self.config.quantize:
+            threshold_expr = f"decode_threshold(node->u.internal.threshold_q)"
+        else:
+            threshold_expr = "SHARED_THRESHOLDS[node->u.internal.threshold_idx]"
+        return f"""
+/* Tree traversal */
+static inline float traverse_tree(int tree_id, const float* x) {{
+    const OptTree* tree = &TREES[tree_id];
+    uint32_t node_idx = tree->start_idx;
+
+    while (node_idx < tree->start_idx + tree->node_count) {{
+        const OptNode* node = &NODES[node_idx];
+
+        if (node->is_leaf) {{
+            return SHARED_LEAVES[node->u.leaf_idx];
+        }}
+
+        float threshold = {threshold_expr};
+
+        if (x[node->u.internal.feature] < threshold) {{
+            node_idx = tree->start_idx + node->u.internal.left;
+        }} else {{
+            node_idx = tree->start_idx + node->u.internal.right;
+        }}
+    }}
+
+    return 0.0f; /* unreachable */
+}}
+"""
+
     def _generate_predict_function(self) -> str:
         """Generate main prediction function"""
         lines = []
@@ -479,6 +576,11 @@ static inline float traverse_tree(int tree_id, const float* x) {
             lines.append("    }")
             lines.append("    return 1.0f / (1.0f + expf(-logit));")
             lines.append("}")
+            lines.append("")
+            lines.append("/* Returns 0 or 1 */")
+            lines.append("static inline int predict_class(const float* x) {")
+            lines.append("    return predict(x) >= 0.5f ? 1 : 0;")
+            lines.append("}")
         else:  # Multiclass
             lines.append("void predict(const float* x, float* output) {")
             lines.append("    for (int c = 0; c < N_CLASSES; c++) {")
@@ -487,6 +589,7 @@ static inline float traverse_tree(int tree_id, const float* x) {
             lines.append("    for (int i = 0; i < N_TREES; i++) {")
             lines.append("        output[i % N_CLASSES] += traverse_tree(i, x);")
             lines.append("    }")
+            lines.append("    /* Numerically stable softmax */")
             lines.append("    float max_val = output[0];")
             lines.append("    for (int c = 1; c < N_CLASSES; c++) {")
             lines.append("        if (output[c] > max_val) max_val = output[c];")
@@ -500,7 +603,18 @@ static inline float traverse_tree(int tree_id, const float* x) {
             lines.append("        output[c] /= sum;")
             lines.append("    }")
             lines.append("}")
-        
+            lines.append("")
+            lines.append("/* Returns the class index with the highest probability */")
+            lines.append("static inline int predict_class(const float* x) {")
+            lines.append("    float probs[N_CLASSES];")
+            lines.append("    predict(x, probs);")
+            lines.append("    int best = 0;")
+            lines.append("    for (int c = 1; c < N_CLASSES; c++) {")
+            lines.append("        if (probs[c] > probs[best]) best = c;")
+            lines.append("    }")
+            lines.append("    return best;")
+            lines.append("}")
+
         return "\n".join(lines)
 
 def optimize_model_for_embedded(

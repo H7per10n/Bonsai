@@ -4,7 +4,7 @@ Parser built from empirical investigation of XGBoost and LightGBM JSON structure
 """
 import json
 from typing import Dict, Any, List, Tuple, Optional
-from model_definitions import TreeData, UnifiedModel, TaskType
+from .model_definitions import TreeData, UnifiedModel, TaskType
 
 def detect_task_type(objective: str, num_class: Optional[int] = None) -> Tuple[TaskType, int]:
     """Detect task type from objective string"""

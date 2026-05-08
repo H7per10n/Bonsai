@@ -10,3 +10,6 @@ build_*/
 .vscode/
 .claude/
 Bonsai/.git/
+gen_minimal/
+models/
+*.pytest_cache
