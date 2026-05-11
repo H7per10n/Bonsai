@@ -10,6 +10,11 @@ desktop.ini
 build_*/
 .vscode/
 .claude/
-Bonsai/.git/
-models/
-*.pytest_cache
+
+# Generated C headers (re-created by test_e2e.py / -m bonsai)
+gen_minimal/
+
+# Pytest-cached models and generated test artifacts
+tests/models/
+tests/generated/
+.pytest_cache/
