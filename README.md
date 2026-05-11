@@ -1,15 +1,8 @@
 # Bonsai
 
-```
-              *  *
-            * * * *
-          * * * * * *
-         * *  *|*  * *
-              _|_
-         ____/   \____
-        |    BONSAI   |
-        |_____________|
-```
+![Uploading image.png…]()
+
+
 
 **Bonsai compiles trained XGBoost / LightGBM models into a single self-contained C header.**
 
