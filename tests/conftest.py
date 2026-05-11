@@ -19,7 +19,7 @@ from sklearn.model_selection import train_test_split
 # Ensure repo root is importable (redundant when root conftest.py is present, kept for safety)
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from Bonsai.model_definitions import TaskType
+from bonsai.model_definitions import TaskType
 
 # ---------------------------------------------------------------------------
 # Paths

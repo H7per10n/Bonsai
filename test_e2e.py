@@ -24,8 +24,8 @@ import xgboost as xgb
 import lightgbm as lgb
 
 sys.path.insert(0, os.path.dirname(__file__))
-from Bonsai import UniversalParser, MinimalEmbeddedTreeGenerator, EmbeddedConfig
-from Bonsai.model_definitions import TaskType
+from bonsai import UniversalParser, MinimalEmbeddedTreeGenerator, EmbeddedConfig
+from bonsai.model_definitions import TaskType
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -34,17 +34,19 @@ from Bonsai.model_definitions import TaskType
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "gen_minimal")
 
 MODES = [
-    ("default",    EmbeddedConfig()),
-    ("q16",        EmbeddedConfig(quantize=True, quantize_bits=16)),
-    ("q8",         EmbeddedConfig(quantize=True, quantize_bits=8)),
+    ("default",  EmbeddedConfig()),
+    ("q16",      EmbeddedConfig(quantize=True, quantize_bits=16)),
+    ("q8",       EmbeddedConfig(quantize=True, quantize_bits=8)),
+    ("dfs",      EmbeddedConfig(dfs_layout=True)),
+    ("dfs_q16",  EmbeddedConfig(dfs_layout=True, quantize=True, quantize_bits=16)),
 ]
 
-# Tolerance: max absolute difference between framework prediction and Bonsai prediction.
-# q8 intentionally trades accuracy for memory so a looser bound is expected.
 TOLERANCE = {
     "default": 1e-3,
     "q16":     1e-2,
     "q8":      1.0,
+    "dfs":     1e-3,
+    "dfs_q16": 1e-2,
 }
 
 N_ROUNDS = 20
@@ -55,12 +57,11 @@ MAX_DEPTH = 4
 # ---------------------------------------------------------------------------
 
 def load_tasks():
-    """Download California Housing and build three task variants."""
     print("Fetching California Housing dataset from sklearn CDN...")
     housing = fetch_california_housing()
     X, y_reg = housing.data.astype(np.float32), housing.target.astype(np.float32)
-    y_bin   = (y_reg > np.median(y_reg)).astype(np.float32)          # above/below median
-    y_multi = np.digitize(y_reg, np.percentile(y_reg, [25, 50, 75])) # price quartile 0-3
+    y_bin   = (y_reg > np.median(y_reg)).astype(np.float32)
+    y_multi = np.digitize(y_reg, np.percentile(y_reg, [25, 50, 75]))
     print(f"  {X.shape[0]:,} samples  {X.shape[1]} features")
     return X, y_reg, y_bin, y_multi
 
@@ -110,7 +111,7 @@ def save_lightgbm(model, path):
 # ---------------------------------------------------------------------------
 
 def run_bonsai(model_path, X_te, orig_pred, mode_name, config, out_dir):
-    """Parse → generate → validate. Returns (max_err, metrics, header_path)."""
+    """Parse → generate → validate. Returns (max_err, generator, header_path)."""
     parsed = UniversalParser.parse(model_path)
     parsed_pred = parsed.predict(X_te)
 
@@ -122,7 +123,153 @@ def run_bonsai(model_path, X_te, orig_pred, mode_name, config, out_dir):
     gen.generate_code(header_path)
 
     max_err = float(np.max(np.abs(orig_pred.ravel() - parsed_pred.ravel())))
-    return max_err, gen.metrics, header_path
+    return max_err, gen, header_path
+
+# ---------------------------------------------------------------------------
+# Reporting helpers
+# ---------------------------------------------------------------------------
+
+def print_comparison_table(results):
+    """Print a side-by-side comparison of all modes across all model/task combos."""
+    mode_names = [m for m, _ in MODES]
+
+    print()
+    print("=" * 100)
+    print("  BONSAI MEMORY OPTIMIZATION  --  FULL COMPARISON TABLE")
+    print("=" * 100)
+
+    # Header
+    col_w = 12
+    print(f"  {'Model':<22}", end="")
+    for m in mode_names:
+        print(f"  {m:>{col_w}}", end="")
+    print()
+
+    # Subheader: bytes
+    print(f"  {'(bytes optimized)':<22}", end="")
+    for _ in mode_names:
+        print(f"  {'bytes':>{col_w}}", end="")
+    print()
+    print(f"  {'-'*22}", end="")
+    for _ in mode_names:
+        print(f"  {'-'*col_w}", end="")
+    print()
+
+    # Data rows: memory bytes per mode
+    for key in sorted(results.keys()):
+        label = key.replace("_", " ")
+        print(f"  {label:<22}", end="")
+        row = results[key]
+        baseline = row.get("default", {}).get("mem", None)
+        for m in mode_names:
+            info = row.get(m, {})
+            mem = info.get("mem", None)
+            if mem is None:
+                print(f"  {'ERR':>{col_w}}", end="")
+            else:
+                print(f"  {mem:>{col_w},}", end="")
+        print()
+
+    # Ratio rows
+    print()
+    print(f"  {'(compression vs 24B/node)':<22}", end="")
+    for _ in mode_names:
+        print(f"  {'ratio x':>{col_w}}", end="")
+    print()
+    print(f"  {'-'*22}", end="")
+    for _ in mode_names:
+        print(f"  {'-'*col_w}", end="")
+    print()
+
+    for key in sorted(results.keys()):
+        label = key.replace("_", " ")
+        print(f"  {label:<22}", end="")
+        row = results[key]
+        for m in mode_names:
+            info = row.get(m, {})
+            ratio = info.get("ratio", None)
+            if ratio is None:
+                print(f"  {'ERR':>{col_w}}", end="")
+            else:
+                print(f"  {ratio:>{col_w}.2f}x", end="")
+        print()
+
+    # Node size rows
+    print()
+    print(f"  {'(node size B)':<22}", end="")
+    for _ in mode_names:
+        print(f"  {'node B':>{col_w}}", end="")
+    print()
+    print(f"  {'-'*22}", end="")
+    for _ in mode_names:
+        print(f"  {'-'*col_w}", end="")
+    print()
+
+    for key in sorted(results.keys()):
+        label = key.replace("_", " ")
+        print(f"  {label:<22}", end="")
+        row = results[key]
+        for m in mode_names:
+            info = row.get(m, {})
+            ns = info.get("node_size", None)
+            if ns is None:
+                print(f"  {'ERR':>{col_w}}", end="")
+            else:
+                print(f"  {ns:>{col_w}}", end="")
+        print()
+
+    # Max error rows
+    print()
+    print(f"  {'(max abs error)':<22}", end="")
+    for _ in mode_names:
+        print(f"  {'max_err':>{col_w}}", end="")
+    print()
+    print(f"  {'-'*22}", end="")
+    for _ in mode_names:
+        print(f"  {'-'*col_w}", end="")
+    print()
+
+    for key in sorted(results.keys()):
+        label = key.replace("_", " ")
+        print(f"  {label:<22}", end="")
+        row = results[key]
+        for m in mode_names:
+            info = row.get(m, {})
+            err = info.get("err", None)
+            ok  = info.get("ok", False)
+            if err is None:
+                print(f"  {'ERR':>{col_w}}", end="")
+            else:
+                marker = "" if ok else "!"
+                print(f"  {err:>{col_w-1}.2e}{marker}", end="")
+        print()
+
+    print("=" * 100)
+
+
+def print_savings_summary(results):
+    """Show average savings of DFS vs default across all models."""
+    default_mems = []
+    dfs_mems     = []
+    for row in results.values():
+        d = row.get("default", {}).get("mem")
+        dfs = row.get("dfs", {}).get("mem")
+        if d and dfs:
+            default_mems.append(d)
+            dfs_mems.append(dfs)
+
+    if not default_mems:
+        return
+
+    avg_default = sum(default_mems) / len(default_mems)
+    avg_dfs     = sum(dfs_mems) / len(dfs_mems)
+    avg_saving  = 100.0 * (avg_default - avg_dfs) / avg_default
+
+    print()
+    print("  DFS layout vs default (averaged across all models):")
+    print(f"    avg default  = {avg_default:,.0f} B")
+    print(f"    avg dfs      = {avg_dfs:,.0f} B")
+    print(f"    avg saving   = {avg_saving:.1f}%")
 
 # ---------------------------------------------------------------------------
 # Main
@@ -136,8 +283,8 @@ def main():
     _,    _,    ym_tr, ym_te = train_test_split(X, y_multi, test_size=0.2, random_state=42)
 
     tasks = [
-        ("regression",  TaskType.REGRESSION,              yr_tr, yr_te, 1),
-        ("binary",      TaskType.BINARY_CLASSIFICATION,   yb_tr, yb_te, 2),
+        ("regression",  TaskType.REGRESSION,                yr_tr, yr_te, 1),
+        ("binary",      TaskType.BINARY_CLASSIFICATION,     yb_tr, yb_te, 2),
         ("multiclass",  TaskType.MULTICLASS_CLASSIFICATION, ym_tr, ym_te, 4),
     ]
 
@@ -147,12 +294,14 @@ def main():
     ]
 
     total_pass = total_fail = 0
+    results: dict = {}        # results[model_key][mode_name] = {mem, ratio, node_size, err, ok}
+    diagnostic_gen = None     # save one generator for the deep diagnostic report
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for task_name, task_type, y_tr, y_te, n_cls in tasks:
-            print(f"\n{'='*62}")
+            print(f"\n{'='*70}")
             print(f"  Task: {task_name.upper()}")
-            print(f"{'='*62}")
+            print(f"{'='*70}")
 
             for fw_tag, fw_name, train_fn, save_fn in frameworks:
                 print(f"\n  {fw_name}")
@@ -162,34 +311,64 @@ def main():
                 save_fn(model, model_path)
 
                 out_dir = os.path.join(OUTPUT_DIR, f"{fw_tag}_{task_name}")
+                model_key = f"{fw_tag}_{task_name}"
+                results[model_key] = {}
 
                 for mode_name, cfg in MODES:
                     tol = TOLERANCE[mode_name]
                     try:
-                        max_err, metrics, hpath = run_bonsai(
+                        max_err, gen, hpath = run_bonsai(
                             model_path, X_te, orig_pred, mode_name, cfg, out_dir
                         )
                         ok = max_err <= tol
                         total_pass += ok
                         total_fail += not ok
                         status = "PASS" if ok else "FAIL"
-                        mem    = metrics.optimized_memory.total_bytes
-                        ratio  = metrics.compression_ratio
+                        mem   = gen.metrics.optimized_memory.total_bytes
+                        ratio = gen.metrics.compression_ratio
+                        ns    = gen.metrics.node_size_reduction[1]
+                        results[model_key][mode_name] = {
+                            "mem": mem, "ratio": ratio, "node_size": ns,
+                            "err": max_err, "ok": ok,
+                        }
                         print(
                             f"    [{status}] {mode_name:<8}  "
                             f"max_err={max_err:.2e}  "
-                            f"memory={mem:,} B  ratio={ratio:.2f}x  "
-                            f"→ {os.path.relpath(hpath)}"
+                            f"memory={mem:,} B  node={ns}B  ratio={ratio:.2f}x  "
+                            f"-> {os.path.relpath(hpath)}"
                         )
+                        # Save XGB regression default+DFS generators for deep dive
+                        if fw_tag == "xgb" and task_name == "regression" and mode_name == "dfs":
+                            diagnostic_gen = gen
                     except Exception as exc:
                         total_fail += 1
+                        results[model_key][mode_name] = {}
                         print(f"    [ERROR] {mode_name:<8}  {exc}")
 
-    print(f"\n{'='*62}")
+    # ------------------------------------------------------------------
+    # Performance comparison table
+    # ------------------------------------------------------------------
+    print_comparison_table(results)
+    print_savings_summary(results)
+
+    # ------------------------------------------------------------------
+    # Deep diagnostic report for one representative model
+    # ------------------------------------------------------------------
+    if diagnostic_gen is not None:
+        print()
+        print("=" * 70)
+        print("  DEEP DIAGNOSTIC  --  XGBoost Regression  (DFS layout)")
+        print("=" * 70)
+        print(diagnostic_gen.detailed_diagnostics())
+
+    # ------------------------------------------------------------------
+    # Overall result
+    # ------------------------------------------------------------------
+    print(f"\n{'='*70}")
     overall = "ALL PASS" if total_fail == 0 else f"{total_fail} FAILED"
-    print(f"  SUMMARY: {total_pass} passed  {total_fail} failed  →  {overall}")
+    print(f"  SUMMARY: {total_pass} passed  {total_fail} failed  ->  {overall}")
     print(f"  C headers in: {OUTPUT_DIR}")
-    print(f"{'='*62}\n")
+    print(f"{'='*70}\n")
     return 0 if total_fail == 0 else 1
 
 

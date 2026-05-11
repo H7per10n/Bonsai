@@ -14,8 +14,8 @@ import os
 import numpy as np
 import pytest
 
-from Bonsai import EmbeddedConfig, MinimalEmbeddedTreeGenerator, UniversalParser
-from Bonsai.model_definitions import TaskType
+from bonsai import EmbeddedConfig, MinimalEmbeddedTreeGenerator, UniversalParser
+from bonsai.model_definitions import TaskType
 
 from .conftest import GENERATED_DIR, TASKS
 
